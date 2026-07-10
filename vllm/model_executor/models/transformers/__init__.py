@@ -68,17 +68,22 @@ def vllm_attention_forward(
     # value up to that width with zeros before calling `Attention`, then slices the output
     # back down afterward. Mirror that here -- a no-op (v_head_dim == head_size) for every
     # non-MLA model.
+    #
+    # The pad/slice must be unconditional (no `if v_head_dim < head_size:` branch): under
+    # full torch.compile + CUDA-graph capture, a Python-level branch around this allocation
+    # produces incorrect (garbled) output on replay even though the branch always resolves
+    # the same way for a given layer -- native's version never branches, which is why it
+    # doesn't hit this. `F.pad` with zero padding and a full-range slice are both no-ops when
+    # v_head_dim == head_size, so dropping the branch changes nothing for non-MLA models.
     head_size = self_attn.head_size
     v_head_dim = value.shape[-1]
-    if v_head_dim < head_size:
-        value = torch.nn.functional.pad(value, [0, head_size - v_head_dim])
+    value = torch.nn.functional.pad(value, [0, head_size - v_head_dim])
 
     query, key, value = (x.reshape(hidden, -1) for x in (query, key, value))
     output = self_attn.forward(query, key, value)
 
-    if v_head_dim < head_size:
-        output = output.view(hidden, self_attn.num_heads, head_size)[..., :v_head_dim]
-        output = output.reshape(hidden, -1)
+    output = output.view(hidden, self_attn.num_heads, head_size)[..., :v_head_dim]
+    output = output.reshape(hidden, -1)
 
     return output, None
 

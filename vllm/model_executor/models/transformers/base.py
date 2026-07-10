@@ -543,11 +543,20 @@ class Base(
         # with zeros before calling `Attention` and slicing the output back down afterward --
         # see `vllm_attention_forward` in this package's `__init__.py`, which mirrors that same
         # pad/slice pattern generically (this dict-of-attrs doesn't know model-specific dims).
+        # `get_num_kv_heads()` also assumes the native absorbed path: it returns 1 for MLA
+        # models (KV becomes MQA-shaped once compressed). The decompressed `key`/`value` this
+        # backend actually has are NOT MQA-shaped -- `kv_b_proj` expands the shared compressed
+        # latent back out to `num_heads` separate per-head K_nope/V pairs (native's own naive
+        # fallback passes `num_kv_heads=self.num_local_heads`, i.e. equal to `num_heads`, for
+        # exactly this reason). Passing the MQA value (1) here silently reinterprets a tensor
+        # holding `num_heads` distinct heads as a single one -- no crash, just wrong (garbled)
+        # output, since the head boundaries get scrambled.
         if self.model_config.is_deepseek_mla:
             qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", 0)
             qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", 0)
             if qk_nope_head_dim and qk_rope_head_dim:
                 head_size = qk_nope_head_dim + qk_rope_head_dim
+                num_kv_heads = num_heads
 
         # In encoder models, the attention layers will have `is_causal=False`
         is_encoder = lambda module: not getattr(module, "is_causal", True)
