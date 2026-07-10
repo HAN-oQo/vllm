@@ -535,18 +535,19 @@ class Base(
         # compressed-latent `MLAAttention`. So `get_head_size()`'s MLA branch (the *compressed*
         # `kv_lora_rank + qk_rope_head_dim` size, meant for that native absorbed path) is the
         # wrong size here: this backend's `key`/`value` are already decompressed by the HF
-        # model's own `kv_b_proj`, at `qk_nope_head_dim + qk_rope_head_dim` (key) /
-        # `v_head_dim` (value) per head -- which differ from each other, so both must be set
-        # explicitly via `head_size_v` (an existing, already-supported asymmetric-head-size
-        # parameter `Attention` has -- see its `head_size_v` constructor arg).
-        head_size_v = head_size
+        # model's own `kv_b_proj`, at `qk_nope_head_dim + qk_rope_head_dim` per head. Use that
+        # directly as the one, uniform `head_size` -- matching vLLM's own native "naive"
+        # (use_mla=False) fallback, `DeepseekV2Attention`
+        # (vllm/model_executor/models/deepseek_v2.py:558-609), which uses this same decompressed
+        # dim as ONE `head_size` for Q, K, *and* V, padding V (narrower, `v_head_dim`) up to it
+        # with zeros before calling `Attention` and slicing the output back down afterward --
+        # see `vllm_attention_forward` in this package's `__init__.py`, which mirrors that same
+        # pad/slice pattern generically (this dict-of-attrs doesn't know model-specific dims).
         if self.model_config.is_deepseek_mla:
             qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", 0)
             qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", 0)
-            v_head_dim = getattr(text_config, "v_head_dim", 0)
-            if qk_nope_head_dim and qk_rope_head_dim and v_head_dim:
+            if qk_nope_head_dim and qk_rope_head_dim:
                 head_size = qk_nope_head_dim + qk_rope_head_dim
-                head_size_v = v_head_dim
 
         # In encoder models, the attention layers will have `is_causal=False`
         is_encoder = lambda module: not getattr(module, "is_causal", True)
@@ -582,7 +583,6 @@ class Base(
             attention_instances[i] = attn_cls(
                 num_heads=num_heads,
                 head_size=head_size,
-                head_size_v=head_size_v,
                 # NOTE: We use Llama scale as default, if it's set by
                 # Transformers, it's updated in vllm_attention_forward
                 scale=head_size**-0.5,

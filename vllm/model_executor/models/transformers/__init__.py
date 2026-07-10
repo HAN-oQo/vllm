@@ -18,6 +18,7 @@
 
 from typing import TYPE_CHECKING
 
+import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from vllm.model_executor.models.transformers.base import Base
@@ -37,8 +38,6 @@ from vllm.model_executor.models.transformers.pooling import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 if TYPE_CHECKING:
-    import torch
-
     from vllm.model_executor.layers.attention import Attention
 
 
@@ -60,8 +59,28 @@ def vllm_attention_forward(
         self_attn.impl.scale = float(scaling)
     hidden = query.shape[-2]
     query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+
+    # MLA models (DeepSeek-V2/V3/etc.): `value`'s real per-head dim (`v_head_dim`) can be
+    # narrower than `query`/`key`'s (`qk_nope_head_dim + qk_rope_head_dim`). `Attention` is
+    # configured with one uniform `head_size` sized to query/key's width (see
+    # `create_attention_instances`), matching vLLM's own native "naive" MLA fallback,
+    # `DeepseekV2Attention` (vllm/model_executor/models/deepseek_v2.py:601-609), which pads
+    # value up to that width with zeros before calling `Attention`, then slices the output
+    # back down afterward. Mirror that here -- a no-op (v_head_dim == head_size) for every
+    # non-MLA model.
+    head_size = self_attn.head_size
+    v_head_dim = value.shape[-1]
+    if v_head_dim < head_size:
+        value = torch.nn.functional.pad(value, [0, head_size - v_head_dim])
+
     query, key, value = (x.reshape(hidden, -1) for x in (query, key, value))
-    return self_attn.forward(query, key, value), None
+    output = self_attn.forward(query, key, value)
+
+    if v_head_dim < head_size:
+        output = output.view(hidden, self_attn.num_heads, head_size)[..., :v_head_dim]
+        output = output.reshape(hidden, -1)
+
+    return output, None
 
 
 ALL_ATTENTION_FUNCTIONS["vllm"] = vllm_attention_forward
